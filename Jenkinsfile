@@ -9,10 +9,10 @@ pipeline {
             }
         }
 
-        stage('Check Environment') {
+        stage('Docker Test') {
             steps {
-                sh 'git --version'
-                sh 'docker --version'
+                sh 'docker run --rm hello-world'
+                echo 'Docker is working correctly!'
             }
         }
     }
