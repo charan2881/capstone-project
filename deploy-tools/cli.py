@@ -4,6 +4,7 @@ import sys
 from config import init_config, show_config, update_config, load_config
 from status import get_service_status
 from jenkins_client import get_job_status, trigger_deployment
+from rollback import rollback_deployment
 
 
 def main():
@@ -44,6 +45,11 @@ def main():
         help="Trigger the Jenkins deployment pipeline"
     )
 
+    subparsers.add_parser(
+        "rollback",
+        help="Roll back ECS to the previous task definition revision"
+    )
+
     args = parser.parse_args()
 
     try:
@@ -67,6 +73,10 @@ def main():
 
         elif args.command == "deploy":
             trigger_deployment()
+
+        elif args.command == "rollback":
+            config = load_config()
+            rollback_deployment(config)
 
     except (FileNotFoundError, ValueError, RuntimeError) as error:
         print(f"Error: {error}", file=sys.stderr)
