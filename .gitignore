@@ -1,0 +1,15 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local deployment configuration
+deploy-tool.json
+
+# Temporary Jenkins API responses
+jenkins-response.json
+job-response.json
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
