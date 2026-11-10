@@ -18,21 +18,16 @@ pipeline {
         string(
             name: 'PROJECT_NAME',
             defaultValue: 'react-app',
-            description: 'React project name'
+            description: 'Unique project name using lowercase letters, numbers and hyphens'
         )
     }
 
     environment {
-        AWS_REGION     = 'ap-south-1'
+        AWS_REGION = 'ap-south-1'
         AWS_ACCOUNT_ID = '587748224398'
 
-        ECR_REPOSITORY = 'react-deployment-app'
-        ECR_URI        = '587748224398.dkr.ecr.ap-south-1.amazonaws.com/react-deployment-app'
-
-        ECS_CLUSTER    = 'react-deployment-cluster'
-        ECS_SERVICE    = 'react-deployment-service'
-        TASK_FAMILY    = 'react-deployment-task'
-        CONTAINER_NAME = 'react-app'
+        ECS_CLUSTER = 'react-deployment-cluster'
+        BASE_TASK_FAMILY = 'react-deployment-task'
 
         CONTAINER_PORT = '80'
     }
@@ -46,16 +41,33 @@ pipeline {
                         error('PROJECT_URL is required.')
                     }
 
-                    if (!params.PROJECT_URL.startsWith('https://github.com/')) {
-                        error('Provide a valid HTTPS GitHub repository URL.')
+                    if (!(params.PROJECT_URL ==~ /^https:\/\/github\.com\/[^\/]+\/[^\/]+(?:\.git)?\/?$/)) {
+                        error('Provide a valid GitHub HTTPS repository URL.')
                     }
 
-                    if (!params.PROJECT_NAME?.trim()) {
-                        error('PROJECT_NAME is required.')
+                    def projectName = params.PROJECT_NAME?.trim()
+
+                    if (!projectName || !(projectName ==~ /^[a-z0-9]+(?:-[a-z0-9]+)*$/)) {
+                        error('PROJECT_NAME must use lowercase letters, numbers and single hyphens.')
                     }
 
-                    echo "Project: ${params.PROJECT_NAME}"
+                    if (projectName.length() > 40) {
+                        error('PROJECT_NAME must not exceed 40 characters.')
+                    }
+
+                    env.PROJECT_NAME = projectName
+                    env.ECR_REPOSITORY = projectName
+                    env.ECR_URI = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${projectName}"
+                    env.ECS_SERVICE = "${projectName}-service"
+                    env.TASK_FAMILY = "${projectName}-task"
+                    env.CONTAINER_NAME = projectName
+                    env.LOG_GROUP = "/ecs/${projectName}-task"
+
+                    echo "Project: ${projectName}"
                     echo "Repository: ${params.PROJECT_URL}"
+                    echo "ECR: ${env.ECR_REPOSITORY}"
+                    echo "ECS service: ${env.ECS_SERVICE}"
+                    echo "Task family: ${env.TASK_FAMILY}"
                 }
             }
         }
@@ -79,7 +91,7 @@ pipeline {
             }
         }
 
-        stage('Check Environment') {
+        stage('Check Environment and Create Resources') {
             steps {
                 sh '''
                     set -eu
@@ -89,22 +101,43 @@ pipeline {
                     aws --version
 
                     ACTUAL_ACCOUNT=$(aws sts get-caller-identity \
-                        --query Account \
-                        --output text)
-
-                    echo "AWS Account: $ACTUAL_ACCOUNT"
+                        --query Account --output text)
 
                     if [ "$ACTUAL_ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
                         echo "ERROR: Incorrect AWS account."
                         exit 1
                     fi
 
-                    aws ecr describe-repositories \
+                    echo "Checking ECR repository: $ECR_REPOSITORY"
+
+                    if ! aws ecr describe-repositories \
                         --repository-names "$ECR_REPOSITORY" \
                         --region "$AWS_REGION" \
-                        --output json
+                        --no-cli-pager >/dev/null 2>&1; then
 
-                    echo "AWS environment verified."
+                        aws ecr create-repository \
+                            --repository-name "$ECR_REPOSITORY" \
+                            --image-scanning-configuration scanOnPush=true \
+                            --region "$AWS_REGION" \
+                            --no-cli-pager
+                    fi
+
+                    echo "Checking CloudWatch log group: $LOG_GROUP"
+
+                    LOG_GROUP_EXISTS=$(aws logs describe-log-groups \
+                        --log-group-name-prefix "$LOG_GROUP" \
+                        --region "$AWS_REGION" \
+                        --query "logGroups[?logGroupName=='$LOG_GROUP'] | length(@)" \
+                        --output text)
+
+                    if [ "$LOG_GROUP_EXISTS" = "0" ]; then
+                        aws logs create-log-group \
+                            --log-group-name "$LOG_GROUP" \
+                            --region "$AWS_REGION" \
+                            --no-cli-pager
+                    fi
+
+                    echo "AWS resources checked successfully."
                 '''
             }
         }
@@ -188,7 +221,7 @@ DOCKERFILE
                         .
 
                     echo "Docker image built successfully."
-                    echo "Image tag: $IMAGE_TAG"
+                    echo "Image: $ECR_URI:$IMAGE_TAG"
                 '''
             }
         }
@@ -221,7 +254,7 @@ DOCKERFILE
                     docker push "$ECR_URI:$IMAGE_TAG"
                     docker push "$ECR_URI:latest"
 
-                    echo "Docker image pushed successfully."
+                    echo "Image pushed to $ECR_REPOSITORY."
                 '''
             }
         }
@@ -232,14 +265,13 @@ DOCKERFILE
                     set -eu
 
                     aws ecs describe-task-definition \
-                        --task-definition "$TASK_FAMILY" \
+                        --task-definition "$BASE_TASK_FAMILY" \
                         --region "$AWS_REGION" \
                         --query taskDefinition \
-                        --output json > task-definition-current.json
+                        --output json \
+                        --no-cli-pager > task-definition-current.json
 
                     export NEW_IMAGE="$ECR_URI:$(cat image-tag.txt)"
-                    export EXPECTED_CONTAINER="$CONTAINER_NAME"
-                    export EXPECTED_PORT="$CONTAINER_PORT"
 
                     python3 - <<'PY'
 import json
@@ -263,42 +295,46 @@ remove_keys = [
 for key in remove_keys:
     task.pop(key, None)
 
-expected_container = os.environ["EXPECTED_CONTAINER"]
-expected_port = int(os.environ["EXPECTED_PORT"])
-new_image = os.environ["NEW_IMAGE"]
+project = os.environ["PROJECT_NAME"]
+image = os.environ["NEW_IMAGE"]
+log_group = os.environ["LOG_GROUP"]
+region = os.environ["AWS_REGION"]
 
-found = False
+task["family"] = f"{project}-task"
 
-for container in task.get("containerDefinitions", []):
-    if container.get("name") == expected_container:
-        container["image"] = new_image
-        found = True
+containers = task.get("containerDefinitions", [])
 
-        ports = container.get("portMappings", [])
+if not containers:
+    raise SystemExit("ERROR: Base task definition has no containers.")
 
-        if not any(
-            p.get("containerPort") == expected_port
-            for p in ports
-        ):
-            raise SystemExit(
-                f"ERROR: Container port {expected_port} "
-                "is not configured in the ECS task definition."
-            )
+container = containers[0]
+container["name"] = project
+container["image"] = image
 
-if not found:
-    raise SystemExit(
-        f"ERROR: Container '{expected_container}' not found."
-    )
+ports = container.get("portMappings", [])
+
+if not any(p.get("containerPort") == 80 for p in ports):
+    raise SystemExit("ERROR: Base task definition does not expose port 80.")
+
+container["logConfiguration"] = {
+    "logDriver": "awslogs",
+    "options": {
+        "awslogs-group": log_group,
+        "awslogs-region": region,
+        "awslogs-stream-prefix": project
+    }
+}
 
 with open("task-definition-new.json", "w", encoding="utf-8") as f:
     json.dump(task, f, indent=2)
 
-print("Updated image:", new_image)
-print("Container:", expected_container)
-print("Container port:", expected_port)
+print("Task family:", task["family"])
+print("Container:", project)
+print("Image:", image)
+print("Log group:", log_group)
 PY
 
-                    echo "Task definition prepared."
+                    echo "Project-specific task definition prepared."
                 '''
             }
         }
@@ -312,7 +348,8 @@ PY
                         --cli-input-json file://task-definition-new.json \
                         --region "$AWS_REGION" \
                         --query taskDefinition.taskDefinitionArn \
-                        --output text > task-definition-arn.txt
+                        --output text \
+                        --no-cli-pager > task-definition-arn.txt
 
                     echo "Registered task definition:"
                     cat task-definition-arn.txt
@@ -320,18 +357,46 @@ PY
             }
         }
 
-        stage('Deploy to ECS') {
+        stage('Create or Update ECS Service') {
             steps {
                 sh '''
                     set -eu
 
                     TASK_DEFINITION_ARN=$(cat task-definition-arn.txt)
 
-                    aws ecs update-service \
+                    SERVICE_STATUS=$(aws ecs describe-services \
                         --cluster "$ECS_CLUSTER" \
-                        --service "$ECS_SERVICE" \
-                        --task-definition "$TASK_DEFINITION_ARN" \
-                        --region "$AWS_REGION"
+                        --services "$ECS_SERVICE" \
+                        --region "$AWS_REGION" \
+                        --query 'services[0].status' \
+                        --output text \
+                        --no-cli-pager)
+
+                    if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+
+                        echo "Updating existing service: $ECS_SERVICE"
+
+                        aws ecs update-service \
+                            --cluster "$ECS_CLUSTER" \
+                            --service "$ECS_SERVICE" \
+                            --task-definition "$TASK_DEFINITION_ARN" \
+                            --region "$AWS_REGION" \
+                            --no-cli-pager
+
+                    else
+
+                        echo "Creating new service: $ECS_SERVICE"
+
+                        aws ecs create-service \
+                            --cluster "$ECS_CLUSTER" \
+                            --service-name "$ECS_SERVICE" \
+                            --task-definition "$TASK_DEFINITION_ARN" \
+                            --desired-count 1 \
+                            --launch-type FARGATE \
+                            --network-configuration "awsvpcConfiguration={subnets=[subnet-0b56f981664920282,subnet-04af69f44a5b07a8e,subnet-0676b4c58d23e643b],securityGroups=[sg-044bca5aafeec830f],assignPublicIp=ENABLED}" \
+                            --region "$AWS_REGION" \
+                            --no-cli-pager
+                    fi
 
                     echo "Waiting for ECS service stability..."
 
@@ -355,9 +420,10 @@ PY
                         --services "$ECS_SERVICE" \
                         --region "$AWS_REGION" \
                         --query 'services[0].{Status:status,Desired:desiredCount,Running:runningCount,TaskDefinition:taskDefinition}' \
-                        --output table
+                        --output table \
+                        --no-cli-pager
 
-                    echo "React deployment verification completed."
+                    echo "Deployment verification completed."
                 '''
             }
         }
@@ -365,7 +431,7 @@ PY
 
     post {
         success {
-            echo 'SUCCESS: React application deployed to AWS ECS.'
+            echo 'SUCCESS: Project deployed to its own AWS ECS service.'
         }
 
         failure {
