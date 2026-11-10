@@ -34,7 +34,7 @@ pipeline {
         TASK_FAMILY    = 'react-deployment-task'
         CONTAINER_NAME = 'react-app'
 
-        CONTAINER_PORT = '5000'
+        CONTAINER_PORT = '80'
     }
 
     stages {
@@ -101,7 +101,8 @@ pipeline {
 
                     aws ecr describe-repositories \
                         --repository-names "$ECR_REPOSITORY" \
-                        --region "$AWS_REGION"
+                        --region "$AWS_REGION" \
+                        --output json
 
                     echo "AWS environment verified."
                 '''
@@ -114,7 +115,6 @@ pipeline {
                     set -eu
 
                     cat > Dockerfile.deploy-tool <<'DOCKERFILE'
-
 FROM node:22-alpine AS build
 
 WORKDIR /app
@@ -146,7 +146,7 @@ COPY --from=build /output/ /usr/share/nginx/html/
 
 RUN printf '%s\\n' \
 'server {' \
-'    listen 5000;' \
+'    listen 80;' \
 '    server_name _;' \
 '    root /usr/share/nginx/html;' \
 '    index index.html;' \
@@ -161,10 +161,9 @@ RUN printf '%s\\n' \
 '}' \
 > /etc/nginx/conf.d/default.conf
 
-EXPOSE 5000
+EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]
-
 DOCKERFILE
 
                     echo "Docker configuration created."
@@ -178,7 +177,6 @@ DOCKERFILE
                     set -eu
 
                     COMMIT_SHA=$(git -C app rev-parse --short=12 HEAD)
-
                     IMAGE_TAG="${BUILD_NUMBER}-${COMMIT_SHA}"
 
                     echo "$IMAGE_TAG" > image-tag.txt
@@ -221,7 +219,6 @@ DOCKERFILE
                     IMAGE_TAG=$(cat image-tag.txt)
 
                     docker push "$ECR_URI:$IMAGE_TAG"
-
                     docker push "$ECR_URI:latest"
 
                     echo "Docker image pushed successfully."
@@ -238,13 +235,10 @@ DOCKERFILE
                         --task-definition "$TASK_FAMILY" \
                         --region "$AWS_REGION" \
                         --query taskDefinition \
-                        --output json \
-                        > task-definition-current.json
+                        --output json > task-definition-current.json
 
                     export NEW_IMAGE="$ECR_URI:$(cat image-tag.txt)"
-
                     export EXPECTED_CONTAINER="$CONTAINER_NAME"
-
                     export EXPECTED_PORT="$CONTAINER_PORT"
 
                     python3 - <<'PY'
@@ -318,8 +312,7 @@ PY
                         --cli-input-json file://task-definition-new.json \
                         --region "$AWS_REGION" \
                         --query taskDefinition.taskDefinitionArn \
-                        --output text \
-                        > task-definition-arn.txt
+                        --output text > task-definition-arn.txt
 
                     echo "Registered task definition:"
                     cat task-definition-arn.txt
@@ -344,7 +337,7 @@ PY
 
                     aws ecs wait services-stable \
                         --cluster "$ECS_CLUSTER" \
-                        --service "$ECS_SERVICE" \
+                        --services "$ECS_SERVICE" \
                         --region "$AWS_REGION"
 
                     echo "ECS service is stable."
